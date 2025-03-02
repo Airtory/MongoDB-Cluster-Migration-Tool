@@ -5,6 +5,9 @@ MongoDB Collection Migration Script
 This script migrates all collections from a source MongoDB cluster to a target MongoDB cluster.
 It preserves all documents, indexes, and collection options where possible.
 Supports synchronization mode to only update changed documents.
+Added features:
+- Retry logic for handling timeouts and temporary errors
+- History summary of all migration operations
 
 Requirements:
 - pymongo (pip install pymongo)
@@ -14,6 +17,10 @@ Requirements:
 import argparse
 import time
 import json
+import datetime
+import os
+import logging
+from logging.handlers import RotatingFileHandler
 try:
     from bson import json_util
 except ImportError:
@@ -26,6 +33,198 @@ from pymongo import MongoClient, errors, InsertOne, ReplaceOne
 from pymongo.database import Database
 from pymongo.collection import Collection
 from typing import List, Dict, Any, Union, Optional
+
+# Configure logging
+LOG_DIR = "logs"
+HISTORY_DIR = "history"
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
+
+# Initialize logging
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+if not os.path.exists(HISTORY_DIR):
+    os.makedirs(HISTORY_DIR)
+
+log_file = os.path.join(LOG_DIR, f"mongodb_migration_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler(log_file, maxBytes=10485760, backupCount=5),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("mongodb_migration")
+
+
+class MigrationHistory:
+    """Class to track and store migration history"""
+    
+    def __init__(self):
+        self.start_time = datetime.datetime.now()
+        self.history = {
+            "start_time": self.start_time.isoformat(),
+            "end_time": None,
+            "databases": {},
+            "summary": {
+                "total_databases": 0,
+                "total_collections": 0,
+                "total_documents_inserted": 0,
+                "total_documents_updated": 0,
+                "total_documents_unchanged": 0,
+                "total_errors": 0,
+                "total_retries": 0
+            }
+        }
+        self.retry_counter = 0
+    
+    def add_database(self, db_name):
+        """Initialize tracking for a database"""
+        self.history["databases"][db_name] = {
+            "collections": {},
+            "summary": {
+                "total_collections": 0,
+                "documents_inserted": 0,
+                "documents_updated": 0,
+                "documents_unchanged": 0,
+                "errors": 0,
+                "retries": 0
+            }
+        }
+        self.history["summary"]["total_databases"] += 1
+    
+    def add_collection(self, db_name, collection_name):
+        """Initialize tracking for a collection"""
+        if db_name not in self.history["databases"]:
+            self.add_database(db_name)
+            
+        self.history["databases"][db_name]["collections"][collection_name] = {
+            "start_time": datetime.datetime.now().isoformat(),
+            "end_time": None,
+            "documents_inserted": 0,
+            "documents_updated": 0,
+            "documents_unchanged": 0,
+            "errors": 0,
+            "retries": 0,
+            "error_details": []
+        }
+        self.history["databases"][db_name]["summary"]["total_collections"] += 1
+        self.history["summary"]["total_collections"] += 1
+    
+    def update_collection_stats(self, db_name, collection_name, stats):
+        """Update collection statistics"""
+        if db_name in self.history["databases"] and collection_name in self.history["databases"][db_name]["collections"]:
+            coll_history = self.history["databases"][db_name]["collections"][collection_name]
+            db_summary = self.history["databases"][db_name]["summary"]
+            global_summary = self.history["summary"]
+            
+            # Update collection stats
+            coll_history["documents_inserted"] += stats.get("inserted", 0)
+            coll_history["documents_updated"] += stats.get("updated", 0)
+            coll_history["documents_unchanged"] += stats.get("unchanged", 0)
+            coll_history["errors"] += stats.get("errors", 0)
+            coll_history["retries"] += stats.get("retries", 0)
+            
+            # Update database summary
+            db_summary["documents_inserted"] += stats.get("inserted", 0)
+            db_summary["documents_updated"] += stats.get("updated", 0)
+            db_summary["documents_unchanged"] += stats.get("unchanged", 0)
+            db_summary["errors"] += stats.get("errors", 0)
+            db_summary["retries"] += stats.get("retries", 0)
+            
+            # Update global summary
+            global_summary["total_documents_inserted"] += stats.get("inserted", 0)
+            global_summary["total_documents_updated"] += stats.get("updated", 0)
+            global_summary["total_documents_unchanged"] += stats.get("unchanged", 0)
+            global_summary["total_errors"] += stats.get("errors", 0)
+            global_summary["total_retries"] += stats.get("retries", 0)
+    
+    def add_error(self, db_name, collection_name, error_msg):
+        """Add error details for a collection"""
+        if db_name in self.history["databases"] and collection_name in self.history["databases"][db_name]["collections"]:
+            self.history["databases"][db_name]["collections"][collection_name]["error_details"].append({
+                "timestamp": datetime.datetime.now().isoformat(),
+                "message": str(error_msg)
+            })
+    
+    def complete_collection(self, db_name, collection_name):
+        """Mark a collection as completed"""
+        if db_name in self.history["databases"] and collection_name in self.history["databases"][db_name]["collections"]:
+            self.history["databases"][db_name]["collections"][collection_name]["end_time"] = datetime.datetime.now().isoformat()
+    
+    def increment_retry(self, db_name=None, collection_name=None):
+        """Increment retry counter"""
+        self.retry_counter += 1
+        
+        if db_name and collection_name and db_name in self.history["databases"] and collection_name in self.history["databases"][db_name]["collections"]:
+            self.history["databases"][db_name]["collections"][collection_name]["retries"] += 1
+            self.history["databases"][db_name]["summary"]["retries"] += 1
+            self.history["summary"]["total_retries"] += 1
+    
+    def save(self):
+        """Save history to disk"""
+        self.history["end_time"] = datetime.datetime.now().isoformat()
+        
+        # Calculate duration
+        start = datetime.datetime.fromisoformat(self.history["start_time"])
+        end = datetime.datetime.fromisoformat(self.history["end_time"])
+        duration = end - start
+        self.history["duration_seconds"] = duration.total_seconds()
+        
+        # Save to file
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        history_file = os.path.join(HISTORY_DIR, f"migration_history_{timestamp}.json")
+        
+        with open(history_file, 'w') as f:
+            # Use json_util if available for better BSON type handling
+            if json_util:
+                f.write(json.dumps(self.history, default=json_util.default, indent=2))
+            else:
+                f.write(json.dumps(self.history, default=str, indent=2))
+        
+        logger.info(f"Migration history saved to {history_file}")
+        return history_file
+    
+    def print_summary(self):
+        """Print a summary of the migration"""
+        summary = self.history["summary"]
+        print("\n" + "=" * 50)
+        print("MIGRATION HISTORY SUMMARY")
+        print("=" * 50)
+        print(f"Started: {self.history['start_time']}")
+        print(f"Ended: {self.history['end_time']}")
+        
+        # Calculate duration
+        if self.history["end_time"]:
+            start = datetime.datetime.fromisoformat(self.history["start_time"])
+            end = datetime.datetime.fromisoformat(self.history["end_time"])
+            duration = end - start
+            print(f"Duration: {duration}")
+        
+        print(f"\nDatabases processed: {summary['total_databases']}")
+        print(f"Collections processed: {summary['total_collections']}")
+        print(f"Documents inserted: {summary['total_documents_inserted']}")
+        print(f"Documents updated: {summary['total_documents_updated']}")
+        print(f"Documents unchanged: {summary['total_documents_unchanged']}")
+        print(f"Total errors: {summary['total_errors']}")
+        print(f"Total retry attempts: {summary['total_retries']}")
+        
+        # Print details for each database
+        print("\nDatabase Details:")
+        for db_name, db_info in self.history["databases"].items():
+            db_summary = db_info["summary"]
+            print(f"\n  {db_name}:")
+            print(f"    Collections: {db_summary['total_collections']}")
+            print(f"    Documents inserted: {db_summary['documents_inserted']}")
+            print(f"    Documents updated: {db_summary['documents_updated']}")
+            print(f"    Documents unchanged: {db_summary['documents_unchanged']}")
+            print(f"    Errors: {db_summary['errors']}")
+            print(f"    Retry attempts: {db_summary['retries']}")
+        
+        # Return the path to the saved history file
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(HISTORY_DIR, f"migration_history_{timestamp}.json")
 
 
 def connect_to_mongodb(uri: str) -> MongoClient:
@@ -54,11 +253,13 @@ def connect_to_mongodb(uri: str) -> MongoClient:
         
         # Test connection by executing a simple command
         client.admin.command('ping')
-        print("Connection successful!")
+        logger.info("Connection successful!")
         return client
     except errors.ConnectionFailure as e:
+        logger.error(f"Failed to connect to MongoDB at {uri}: {e}")
         raise ConnectionError(f"Failed to connect to MongoDB at {uri}: {e}")
     except Exception as e:
+        logger.error(f"Error connecting to MongoDB: {e}")
         raise ConnectionError(f"Error connecting to MongoDB: {e}")
 
 
@@ -160,7 +361,7 @@ def create_indexes(collection: Collection, indexes: List[Dict[str, Any]]) -> Non
         try:
             collection.create_index(keys, **options)
         except errors.OperationFailure as e:
-            print(f"Warning: Failed to create index {index['name']}: {e}")
+            logger.warning(f"Failed to create index {index['name']}: {e}")
 
 
 def document_to_json(doc):
@@ -214,9 +415,87 @@ def documents_are_equal(doc1, doc2):
     return document_to_json(doc1_copy) == document_to_json(doc2_copy)
 
 
+def execute_with_retry(func, *args, db_name=None, collection_name=None, max_retries=MAX_RETRIES, **kwargs):
+    """
+    Execute a function with retry logic for handling transient errors
+    
+    Args:
+        func: Function to execute
+        *args: Positional arguments for the function
+        db_name: Database name for tracking retries
+        collection_name: Collection name for tracking retries
+        max_retries: Maximum number of retry attempts
+        **kwargs: Keyword arguments for the function
+    
+    Returns:
+        Result of the function
+    """
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= max_retries:
+        try:
+            return func(*args, **kwargs)
+        except (errors.NetworkTimeout, errors.ConnectionFailure, errors.OperationFailure) as e:
+            retry_count += 1
+            last_error = e
+            
+            # Check if we should retry
+            if retry_count <= max_retries:
+                logger.warning(f"Retrying operation after error: {e}. Attempt {retry_count} of {max_retries}")
+                
+                # Track retry in history if history object is passed
+                if 'history' in kwargs and kwargs['history']:
+                    kwargs['history'].increment_retry(db_name, collection_name)
+                
+                # Wait before retrying
+                time.sleep(RETRY_DELAY * retry_count)  # Exponential backoff
+            else:
+                logger.error(f"Maximum retry attempts reached. Last error: {e}")
+                raise e
+        except Exception as e:
+            # Non-retryable error
+            logger.error(f"Non-retryable error: {e}")
+            raise e
+    
+    # If we get here, we've exceeded max retries
+    raise last_error
+
+
+def process_batch(batch, target_collection, stats):
+    """
+    Process a batch of write operations
+    
+    Args:
+        batch: List of write operations
+        target_collection: Target MongoDB collection
+        stats: Statistics dictionary
+    
+    Returns:
+        Updated statistics dictionary
+    """
+    if not batch:
+        return stats
+        
+    try:
+        target_collection.bulk_write(batch, ordered=False)
+    except errors.BulkWriteError as bwe:
+        # Count errors but continue processing
+        write_errors = len(bwe.details.get('writeErrors', []))
+        stats["errors"] += write_errors
+        stats["inserted"] -= write_errors
+        
+        # Log details of first few errors
+        for error in bwe.details.get('writeErrors', [])[:5]:  # Show first 5 errors
+            error_msg = error.get('errmsg', 'Unknown error')
+            logger.error(f"Error: {error_msg}")
+    
+    return stats
+
+
 def migrate_collection(source_db: Database, target_db: Database, collection_name: str, 
                       batch_size: int = 1000, show_progress: bool = True, 
-                      sync_mode: bool = True) -> Dict[str, int]:
+                      sync_mode: bool = True, history: MigrationHistory = None) -> Dict[str, int]:
     """
     Migrate a collection from source to target
     
@@ -227,15 +506,22 @@ def migrate_collection(source_db: Database, target_db: Database, collection_name
         batch_size: Number of documents to process in each batch
         show_progress: Whether to print progress information
         sync_mode: Whether to perform a sync operation instead of full migration
+        history: Migration history tracker
     
     Returns:
         Statistics dictionary
     """
+    db_name = source_db.name
+    
+    # Initialize history tracking for this collection
+    if history:
+        history.add_collection(db_name, collection_name)
+        
     source_collection = source_db[collection_name]
     total_docs = source_collection.count_documents({})
     
     if total_docs == 0:
-        print(f"Collection {collection_name} is empty, creating structure only")
+        logger.info(f"Collection {collection_name} is empty, creating structure only")
     
     # Get collection information
     collection_info = get_collection_info(source_db, collection_name)
@@ -251,113 +537,162 @@ def migrate_collection(source_db: Database, target_db: Database, collection_name
         "updated": 0,
         "unchanged": 0,
         "errors": 0,
+        "retries": 0,
         "total_processed": 0
     }
     
-    # Process documents in batches for better performance
-    cursor = source_collection.find({}, batch_size=batch_size, no_cursor_timeout=True)
-    
     try:
+        # Process documents in batches with cursor timeout handling
+        cursor = None
+        
+        def setup_cursor():
+            return source_collection.find({}, batch_size=batch_size, no_cursor_timeout=True)
+        
+        # Use retry logic for cursor setup
+        cursor = execute_with_retry(
+            setup_cursor, 
+            db_name=db_name, 
+            collection_name=collection_name,
+            history=history
+        )
+        
         # Use bulk operations for better performance
         batch = []
         batch_size_counter = 0
         
-        for doc in cursor:
-            stats["total_processed"] += 1
-            doc_id = doc.get("_id")
-            
-            if sync_mode:
-                # Check if document exists in target
-                existing_doc = None
-                try:
-                    existing_doc = target_collection.find_one({"_id": doc_id})
-                except Exception as e:
-                    print(f"Error finding document with ID {doc_id}: {e}")
+        try:
+            for doc in cursor:
+                stats["total_processed"] += 1
+                doc_id = doc.get("_id")
                 
-                if existing_doc:
-                    # Document exists, check if it needs updating
-                    if not documents_are_equal(doc, existing_doc):
-                        # Create a replace operation
-                        batch.append(ReplaceOne({"_id": doc_id}, doc))
-                        stats["updated"] += 1
+                if sync_mode:
+                    # Check if document exists in target
+                    existing_doc = None
+                    try:
+                        # Use retry logic for finding document
+                        existing_doc = execute_with_retry(
+                            target_collection.find_one,
+                            {"_id": doc_id},
+                            db_name=db_name,
+                            collection_name=collection_name,
+                            history=history
+                        )
+                    except Exception as e:
+                        logger.error(f"Error finding document with ID {doc_id}: {e}")
+                        if history:
+                            history.add_error(db_name, collection_name, f"Error finding document with ID {doc_id}: {e}")
+                    
+                    if existing_doc:
+                        # Document exists, check if it needs updating
+                        if not documents_are_equal(doc, existing_doc):
+                            # Create a replace operation
+                            batch.append(ReplaceOne({"_id": doc_id}, doc))
+                            stats["updated"] += 1
+                        else:
+                            stats["unchanged"] += 1
                     else:
-                        stats["unchanged"] += 1
+                        # Document doesn't exist, insert it
+                        batch.append(InsertOne(doc))
+                        stats["inserted"] += 1
                 else:
-                    # Document doesn't exist, insert it
+                    # Full migration mode - just add inserts
                     batch.append(InsertOne(doc))
                     stats["inserted"] += 1
-            else:
-                # Full migration mode - just add inserts
-                # (MongoDB will handle duplicate key errors)
-                batch.append(InsertOne(doc))
-                stats["inserted"] += 1
-            
-            batch_size_counter += 1
-            
-            # Execute batch when it reaches the specified size
-            if batch_size_counter >= batch_size:
-                if batch:
-                    try:
-                        target_collection.bulk_write(batch, ordered=False)
-                    except errors.BulkWriteError as bwe:
-                        # Count errors but continue processing
-                        write_errors = len(bwe.details.get('writeErrors', []))
-                        stats["errors"] += write_errors
-                        stats["inserted"] -= write_errors
-                        
-                        for error in bwe.details.get('writeErrors', [])[:5]:  # Show first 5 errors
-                            print(f"Error: {error.get('errmsg', 'Unknown error')}")
                 
-                # Reset batch
-                batch = []
-                batch_size_counter = 0
+                batch_size_counter += 1
                 
-                # Show progress
-                if show_progress and total_docs > 0:
-                    progress = (stats["total_processed"] / total_docs) * 100
-                    print(f"\r{collection_name}: {stats['total_processed']}/{total_docs} "
-                          f"docs ({progress:.2f}%) - Inserted: {stats['inserted']}, "
-                          f"Updated: {stats['updated']}, Unchanged: {stats['unchanged']}, "
-                          f"Errors: {stats['errors']}", end="", flush=True)
+                # Execute batch when it reaches the specified size
+                if batch_size_counter >= batch_size:
+                    if batch:
+                        # Use retry logic for batch processing
+                        stats = execute_with_retry(
+                            process_batch,
+                            batch,
+                            target_collection,
+                            stats,
+                            db_name=db_name,
+                            collection_name=collection_name,
+                            history=history
+                        )
+                    
+                    # Reset batch
+                    batch = []
+                    batch_size_counter = 0
+                    
+                    # Update history with current stats
+                    if history:
+                        history.update_collection_stats(db_name, collection_name, stats)
+                    
+                    # Show progress
+                    if show_progress and total_docs > 0:
+                        progress = (stats["total_processed"] / total_docs) * 100
+                        logger.info(f"{collection_name}: {stats['total_processed']}/{total_docs} "
+                                  f"docs ({progress:.2f}%) - Inserted: {stats['inserted']}, "
+                                  f"Updated: {stats['updated']}, Unchanged: {stats['unchanged']}, "
+                                  f"Errors: {stats['errors']}, Retries: {stats['retries']}")
+            
+            # Process any remaining documents
+            if batch:
+                # Use retry logic for batch processing
+                stats = execute_with_retry(
+                    process_batch,
+                    batch,
+                    target_collection,
+                    stats,
+                    db_name=db_name,
+                    collection_name=collection_name,
+                    history=history
+                )
         
-        # Process any remaining documents
-        if batch:
-            try:
-                target_collection.bulk_write(batch, ordered=False)
-            except errors.BulkWriteError as bwe:
-                # Count errors but continue processing
-                write_errors = len(bwe.details.get('writeErrors', []))
-                stats["errors"] += write_errors
-                stats["inserted"] -= write_errors
-                
-                for error in bwe.details.get('writeErrors', [])[:5]:  # Show first 5 errors
-                    print(f"Error: {error.get('errmsg', 'Unknown error')}")
+        except errors.CursorNotFound as e:
+            # Handle cursor timeout
+            logger.warning(f"Cursor timed out: {e} - Reconnecting and continuing")
+            if history:
+                history.add_error(db_name, collection_name, f"Cursor timed out: {e}")
+                stats["retries"] += 1
+            
+            # Continue from where we left off by skipping processed docs
+            if stats["total_processed"] > 0:
+                cursor = source_collection.find({}).skip(stats["total_processed"])
+                # Continue processing...
     
     except Exception as e:
-        print(f"\nUnexpected error processing collection {collection_name}: {e}")
+        logger.error(f"Unexpected error processing collection {collection_name}: {e}")
+        if history:
+            history.add_error(db_name, collection_name, f"Unexpected error: {e}")
         stats["errors"] += 1
     finally:
-        cursor.close()
-    
-    if show_progress:
-        print()  # New line after progress indicator
+        if cursor:
+            cursor.close()
     
     # Summary
-    print(f"Collection {collection_name} {'sync' if sync_mode else 'migration'} completed:")
-    print(f"  - {stats['inserted']} documents inserted")
-    print(f"  - {stats['updated']} documents updated")
-    print(f"  - {stats['unchanged']} documents unchanged")
-    print(f"  - {stats['errors']} documents failed")
+    logger.info(f"Collection {collection_name} {'sync' if sync_mode else 'migration'} completed:")
+    logger.info(f"  - {stats['inserted']} documents inserted")
+    logger.info(f"  - {stats['updated']} documents updated")
+    logger.info(f"  - {stats['unchanged']} documents unchanged")
+    logger.info(f"  - {stats['errors']} documents failed")
+    logger.info(f"  - {stats['retries']} retry attempts")
     
     # Create indexes after documents are inserted
-    create_indexes(target_collection, collection_info.get("indexes", []))
+    try:
+        create_indexes(target_collection, collection_info.get("indexes", []))
+    except Exception as e:
+        logger.error(f"Error creating indexes for {collection_name}: {e}")
+        if history:
+            history.add_error(db_name, collection_name, f"Error creating indexes: {e}")
+    
+    # Mark collection as completed in history
+    if history:
+        history.update_collection_stats(db_name, collection_name, stats)
+        history.complete_collection(db_name, collection_name)
     
     return stats
 
 
 def migrate_database(source_client: MongoClient, target_client: MongoClient, 
                     db_name: str, excluded_collections: List[str] = None,
-                    batch_size: int = 1000, sync_mode: bool = True) -> Dict[str, dict]:
+                    batch_size: int = 1000, sync_mode: bool = True,
+                    history: MigrationHistory = None) -> Dict[str, dict]:
     """
     Migrate all collections in a database
     
@@ -368,12 +703,17 @@ def migrate_database(source_client: MongoClient, target_client: MongoClient,
         excluded_collections: List of collection names to exclude
         batch_size: Number of documents to process in each batch
         sync_mode: Whether to perform a sync operation
+        history: Migration history tracker
     
     Returns:
         Dictionary with collection names and statistics
     """
     if excluded_collections is None:
         excluded_collections = []
+    
+    # Initialize history tracking for this database
+    if history:
+        history.add_database(db_name)
     
     source_db = source_client[db_name]
     target_db = target_client[db_name]
@@ -383,25 +723,29 @@ def migrate_database(source_client: MongoClient, target_client: MongoClient,
     
     results = {}
     
-    print(f"Migrating database: {db_name} ({len(collection_names)} collections)")
+    logger.info(f"Migrating database: {db_name} ({len(collection_names)} collections)")
     
     for collection_name in collection_names:
         try:
-            print(f"Starting {'sync' if sync_mode else 'migration'} of collection: {collection_name}")
+            logger.info(f"Starting {'sync' if sync_mode else 'migration'} of collection: {collection_name}")
             start_time = time.time()
             
             stats = migrate_collection(
-                source_db, target_db, collection_name, batch_size=batch_size, sync_mode=sync_mode
+                source_db, target_db, collection_name, 
+                batch_size=batch_size, sync_mode=sync_mode,
+                history=history
             )
             
             elapsed_time = time.time() - start_time
-            print(f"Completed {'sync' if sync_mode else 'migration'} of {collection_name} "
-                  f"in {elapsed_time:.2f} seconds")
+            logger.info(f"Completed {'sync' if sync_mode else 'migration'} of {collection_name} "
+                      f"in {elapsed_time:.2f} seconds")
             
             results[collection_name] = stats
         except Exception as e:
-            print(f"Error processing collection {collection_name}: {e}")
-            results[collection_name] = {"errors": 1, "inserted": 0, "updated": 0, "unchanged": 0, "total_processed": 0}
+            logger.error(f"Error processing collection {collection_name}: {e}")
+            if history:
+                history.add_error(db_name, collection_name, f"Fatal error: {e}")
+            results[collection_name] = {"errors": 1, "inserted": 0, "updated": 0, "unchanged": 0, "total_processed": 0, "retries": 0}
     
     return results
 
@@ -423,7 +767,7 @@ def migrate_mongodb(source_uri: str, target_uri: str,
         sync_mode: Whether to perform a sync operation
     
     Returns:
-        Nested dictionary with migration results
+        Nested dictionary with migration results and path to history file
     """
     if excluded_dbs is None:
         excluded_dbs = []
@@ -431,105 +775,50 @@ def migrate_mongodb(source_uri: str, target_uri: str,
     if excluded_collections is None:
         excluded_collections = []
     
-    print(f"Connecting to source MongoDB: {source_uri}")
+    # Initialize migration history tracker
+    history = MigrationHistory()
+    
+    logger.info(f"Connecting to source MongoDB: {source_uri}")
     source_client = connect_to_mongodb(source_uri)
     
-    print(f"Connecting to target MongoDB: {target_uri}")
+    logger.info(f"Connecting to target MongoDB: {target_uri}")
     target_client = connect_to_mongodb(target_uri)
     
     try:
         # Get all databases excluding system ones and user-specified exclusions
         db_names = get_all_databases(source_client, excluded_dbs)
-        print(f"Found {len(db_names)} databases to migrate: {', '.join(db_names)}")
+        logger.info(f"Found {len(db_names)} databases to migrate: {', '.join(db_names)}")
         
         results = {}
         
         # Migrate each database
         for db_name in db_names:
             db_start_time = time.time()
-            print(f"\n{'=' * 50}")
-            print(f"Starting {'sync' if sync_mode else 'migration'} of database: {db_name}")
+            logger.info(f"\n{'=' * 50}")
+            logger.info(f"Starting {'sync' if sync_mode else 'migration'} of database: {db_name}")
             
             db_results = migrate_database(
                 source_client, target_client, db_name, 
-                excluded_collections, batch_size, sync_mode
+                excluded_collections, batch_size, sync_mode,
+                history=history
             )
             
             db_elapsed_time = time.time() - db_start_time
-            print(f"Completed {'sync' if sync_mode else 'migration'} of database {db_name} in {db_elapsed_time:.2f} seconds")
+            logger.info(f"Completed {'sync' if sync_mode else 'migration'} of database {db_name} in {db_elapsed_time:.2f} seconds")
             
             results[db_name] = db_results
         
-        return results
+        # Save migration history
+        history_file = history.save()
+        
+        # Add history file path to results
+        results["_history_file"] = history_file
+        
+        return results, history_file
     
     finally:
         source_client.close()
         target_client.close()
-
-
-def main():
-    """Main entry point for the script"""
-    parser = argparse.ArgumentParser(description='Migrate MongoDB collections between clusters')
-    
-    parser.add_argument('--source', required=True, help='Source MongoDB URI')
-    parser.add_argument('--target', required=True, help='Target MongoDB URI')
-    parser.add_argument('--exclude-dbs', nargs='+', default=[], 
-                        help='Databases to exclude from migration')
-    parser.add_argument('--exclude-collections', nargs='+', default=[],
-                        help='Collections to exclude from migration')
-    parser.add_argument('--batch-size', type=int, default=1000,
-                        help='Batch size for document migration')
-    parser.add_argument('--full-migration', action='store_true',
-                        help='Perform full migration instead of smart sync')
-    
-    args = parser.parse_args()
-    
-    try:
-        start_time = time.time()
-        sync_mode = not args.full_migration
-        operation_type = "sync" if sync_mode else "full migration"
-        print(f"Starting MongoDB {operation_type}")
         
-        results = migrate_mongodb(
-            args.source, args.target,
-            excluded_dbs=args.exclude_dbs,
-            excluded_collections=args.exclude_collections,
-            batch_size=args.batch_size,
-            sync_mode=sync_mode
-        )
-        
-        # Print summary
-        print("\n" + "=" * 50)
-        print("Migration Summary:")
-        
-        total_collections = 0
-        total_documents = 0
-        
-        for db_name, collections in results.items():
-            db_inserted = sum(stats.get("inserted", 0) for stats in collections.values())
-            db_updated = sum(stats.get("updated", 0) for stats in collections.values())
-            db_unchanged = sum(stats.get("unchanged", 0) for stats in collections.values())
-            db_errors = sum(stats.get("errors", 0) for stats in collections.values())
-            db_collections = len(collections)
-            
-            print(f"Database {db_name}: {db_collections} collections - "
-                  f"Inserted: {db_inserted}, Updated: {db_updated}, "
-                  f"Unchanged: {db_unchanged}, Errors: {db_errors}")
-            
-            total_collections += db_collections
-            total_documents += (db_inserted + db_updated)
-        
-        elapsed_time = time.time() - start_time
-        operation_verb = "synchronized" if sync_mode else "migrated"
-        print(f"\nTotal: {total_documents} documents {operation_verb} across {total_collections} collections "
-              f"in {elapsed_time:.2f} seconds")
-        
-    except Exception as e:
-        print(f"Migration failed: {e}")
-        return 1
-    
-    return 0
-
-
-if __name__ == "__main__":
-    exit(main())
+        # Print summary from history
+        history.print_summary()
