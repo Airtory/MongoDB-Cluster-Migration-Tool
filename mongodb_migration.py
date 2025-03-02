@@ -23,10 +23,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 try:
     from bson import json_util
+    BSON_AVAILABLE = True
 except ImportError:
     # When bson is not available, define a basic json_util
     # This is less accurate but will work for basic documents
     json_util = None
+    BSON_AVAILABLE = False
     print("Warning: bson module not found. Using basic JSON comparison.")
     print("Install pymongo completely with: pip install pymongo[srv]")
 from pymongo import MongoClient, errors, InsertOne, ReplaceOne
@@ -34,28 +36,54 @@ from pymongo.database import Database
 from pymongo.collection import Collection
 from typing import List, Dict, Any, Union, Optional
 
-# Configure logging
+# Configure constants and settings
 LOG_DIR = "logs"
 HISTORY_DIR = "history"
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
+VERSION = "1.1.0"
 
-# Initialize logging
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
-if not os.path.exists(HISTORY_DIR):
-    os.makedirs(HISTORY_DIR)
+# Create directories if they don't exist
+for directory in [LOG_DIR, HISTORY_DIR]:
+    if not os.path.exists(directory):
+        try:
+            os.makedirs(directory)
+            print(f"Created directory: {directory}")
+        except Exception as e:
+            print(f"Warning: Could not create directory {directory}: {e}")
+            # Use current directory as fallback
+            if directory == LOG_DIR:
+                LOG_DIR = "."
+            elif directory == HISTORY_DIR:
+                HISTORY_DIR = "."
 
-log_file = os.path.join(LOG_DIR, f"mongodb_migration_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        RotatingFileHandler(log_file, maxBytes=10485760, backupCount=5),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("mongodb_migration")
+# Set up logging
+timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+log_file = os.path.join(LOG_DIR, f"mongodb_migration_{timestamp}.log")
+
+try:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            RotatingFileHandler(log_file, maxBytes=10485760, backupCount=5),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger("mongodb_migration")
+    logger.info(f"MongoDB Migration Tool v{VERSION} starting up")
+except Exception as e:
+    print(f"Warning: Could not initialize logging to file: {e}")
+    # Fallback to basic logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger("mongodb_migration")
+    logger.info(f"MongoDB Migration Tool v{VERSION} starting up (fallback logging)")
+
+print(f"MongoDB Migration Tool v{VERSION}")
+print(f"Logging to: {log_file}")
 
 
 class MigrationHistory:
@@ -241,6 +269,9 @@ def connect_to_mongodb(uri: str) -> MongoClient:
         # Check if essential parameters are in the URI and add them if missing
         if "ssl=" not in uri.lower() and "tls=" not in uri.lower():
             uri += "&ssl=true" if "?" in uri else "?ssl=true"
+        
+        print(f"Connecting with timeout settings: connectTimeoutMS=30000, socketTimeoutMS=45000")
+        logger.debug(f"Connecting with URI pattern: {uri.split('@')[0]}@*****")
             
         # Set longer timeouts for stability
         client = MongoClient(
@@ -253,14 +284,19 @@ def connect_to_mongodb(uri: str) -> MongoClient:
         
         # Test connection by executing a simple command
         client.admin.command('ping')
+        print("Connection successful!")
         logger.info("Connection successful!")
         return client
     except errors.ConnectionFailure as e:
-        logger.error(f"Failed to connect to MongoDB at {uri}: {e}")
-        raise ConnectionError(f"Failed to connect to MongoDB at {uri}: {e}")
+        error_msg = f"Failed to connect to MongoDB: {e}"
+        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
+        raise ConnectionError(error_msg)
     except Exception as e:
-        logger.error(f"Error connecting to MongoDB: {e}")
-        raise ConnectionError(f"Error connecting to MongoDB: {e}")
+        error_msg = f"Error connecting to MongoDB: {e}"
+        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
+        raise ConnectionError(error_msg)
 
 
 def get_all_databases(client: MongoClient, excluded_dbs: List[str] = None) -> List[str]:
@@ -754,7 +790,7 @@ def migrate_mongodb(source_uri: str, target_uri: str,
                    excluded_dbs: List[str] = None,
                    excluded_collections: List[str] = None,
                    batch_size: int = 1000,
-                   sync_mode: bool = True) -> Dict[str, Dict[str, dict]]:
+                   sync_mode: bool = True) -> tuple:
     """
     Migrate all databases and collections from source to target MongoDB cluster
     
@@ -767,7 +803,7 @@ def migrate_mongodb(source_uri: str, target_uri: str,
         sync_mode: Whether to perform a sync operation
     
     Returns:
-        Nested dictionary with migration results and path to history file
+        Tuple of (results_dict, history_file_path)
     """
     if excluded_dbs is None:
         excluded_dbs = []
@@ -778,23 +814,35 @@ def migrate_mongodb(source_uri: str, target_uri: str,
     # Initialize migration history tracker
     history = MigrationHistory()
     
+    # Print connection information
+    print(f"Connecting to source MongoDB: {source_uri}")
     logger.info(f"Connecting to source MongoDB: {source_uri}")
     source_client = connect_to_mongodb(source_uri)
     
+    print(f"Connecting to target MongoDB: {target_uri}")
     logger.info(f"Connecting to target MongoDB: {target_uri}")
     target_client = connect_to_mongodb(target_uri)
     
     try:
         # Get all databases excluding system ones and user-specified exclusions
         db_names = get_all_databases(source_client, excluded_dbs)
+        print(f"Found {len(db_names)} databases to migrate: {', '.join(db_names)}")
         logger.info(f"Found {len(db_names)} databases to migrate: {', '.join(db_names)}")
+        
+        if not db_names:
+            print("No databases found to migrate. Please check your connection and exclusion settings.")
+            logger.warning("No databases found to migrate.")
+            return {}, None
         
         results = {}
         
         # Migrate each database
         for db_name in db_names:
             db_start_time = time.time()
-            logger.info(f"\n{'=' * 50}")
+            separator = "=" * 50
+            print(f"\n{separator}")
+            print(f"Starting {'sync' if sync_mode else 'migration'} of database: {db_name}")
+            logger.info(f"\n{separator}")
             logger.info(f"Starting {'sync' if sync_mode else 'migration'} of database: {db_name}")
             
             db_results = migrate_database(
