@@ -31,6 +31,39 @@ This tool will help you seamlessly migrate data between MongoDB clusters while p
 
 The script will connect to both MongoDB clusters, identify all databases and collections to migrate, and then process each document while maintaining its exact structure. It will also recreate all indexes and collection options on the target.
 
-For a complete documentation, installation options, and troubleshooting tips, please refer to the guide I've provided in the artifacts.
+### Handling Clusters
 
-Would you like me to explain any specific part of the implementation or usage in more detail?
+Here's an example URI for connecting to a MongoDB cluster with all the necessary settings:
+
+```
+mongodb://username:password@cluster0-shard-00-00.abcde.mongodb.net:27017,cluster0-shard-00-01.abcde.mongodb.net:27017,cluster0-shard-00-02.abcde.mongodb.net:27017/?ssl=true&replicaSet=atlas-123abc&authSource=admin
+```
+
+Let me break down the components:
+
+1. **Protocol**: `mongodb://`
+2. **Authentication**: `username:password@`
+3. **Cluster nodes**: List of all replica set members, separated by commas
+   - `cluster0-shard-00-00.abcde.mongodb.net:27017`
+   - `cluster0-shard-00-01.abcde.mongodb.net:27017`
+   - `cluster0-shard-00-02.abcde.mongodb.net:27017`
+4. **Query parameters** (after the `?`):
+   - `ssl=true` - Required for secure connections, especially with Atlas
+   - `replicaSet=atlas-123abc` - The name of your replica set (find this in Atlas UI)
+   - `authSource=admin` - Database used for authentication (typically "admin")
+
+If you're using MongoDB Atlas, you can also use the SRV format, which is shorter:
+
+```
+mongodb+srv://username:password@cluster0.abcde.mongodb.net/?authSource=admin
+```
+
+The SRV format automatically handles finding all the servers in your cluster and enables SSL by default.
+
+When running the migration script, you would use these URIs like:
+
+```bash
+python mongodb_migration.py \
+  --source "mongodb://username:password@source-cluster-00-00.abcde.mongodb.net:27017,source-cluster-00-01.abcde.mongodb.net:27017,source-cluster-00-02.abcde.mongodb.net:27017/?ssl=true&replicaSet=atlas-abc123&authSource=admin" \
+  --target "mongodb://username:password@target-cluster-00-00.xyzab.mongodb.net:27017,target-cluster-00-01.xyzab.mongodb.net:27017,target-cluster-00-02.xyzab.mongodb.net:27017/?ssl=true&replicaSet=atlas-xyz456&authSource=admin"
+```
